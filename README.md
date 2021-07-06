@@ -1,4 +1,4 @@
 # ControllableTTS-dev
 
-### Fundamental Frequency Encoder - Fastpitch
-### Transformer Based Implementation w/
+1. Fundamental Frequency Encoder - Fastpitch
+2. Transformer Based Implementation w/ prosody features
