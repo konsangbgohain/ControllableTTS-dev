@@ -1,388 +1,575 @@
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
+# *****************************************************************************
+#  Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
+#
+#  Redistribution and use in source and binary forms, with or without
+#  modification, are permitted provided that the following conditions are met:
+#      * Redistributions of source code must retain the above copyright
+#        notice, this list of conditions and the following disclaimer.
+#      * Redistributions in binary form must reproduce the above copyright
+#        notice, this list of conditions and the following disclaimer in the
+#        documentation and/or other materials provided with the distribution.
+#      * Neither the name of the NVIDIA CORPORATION nor the
+#        names of its contributors may be used to endorse or promote products
+#        derived from this software without specific prior written permission.
+#
+#  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+#  ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+#  WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+#  DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE FOR ANY
+#  DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+#  (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+#  LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+#  ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+#  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+#  SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# *****************************************************************************
+
+import argparse
+import copy
+import json
+import glob
+import os
+import re
+import time
+from collections import defaultdict, OrderedDict
+from contextlib import contextmanager
 
 import numpy as np
-import argparse
-import os
-import time
+import nvidia_dlprof_pytorch_nvtx as pyprof
+import torch
+import torch.cuda.profiler as profiler
+import torch.distributed as dist
+from scipy.io.wavfile import write as write_wav
+from torch.autograd import Variable
+from torch.nn.parallel import DistributedDataParallel
+from torch.nn.parameter import Parameter
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
-from styler import STYLER
-from loss import STYLERLoss, DomainAdversarialTrainingLoss
-from dataset import Dataset
-from optimizer import ScheduledOptim
-from evaluate import evaluate
-import hparams as hp
-import utils
-import audio as Audio
+import common.tb_dllogger as logger
+from apex import amp
+from apex.optimizers import FusedAdam, FusedLAMB
+from apex.multi_tensor_apply import multi_tensor_applier
+import amp_C
 
-
-def main(args):
-    torch.manual_seed(0)
-
-    # Get device
-    device = torch.device('cuda'if torch.cuda.is_available()else 'cpu')
-
-    # Get dataset
-    dataset = Dataset("train.txt")
-    loader = DataLoader(dataset, batch_size=hp.batch_size**2, shuffle=True,
-                        collate_fn=dataset.collate_fn, drop_last=True, num_workers=0)
-
-    # Define model
-    model = nn.DataParallel(STYLER()).to(device)
-    print("Model Has Been Defined")
-    
-    # Parameters
-    num_param = utils.get_param_num(model)
-    text_encoder = utils.get_param_num(model.module.style_modeling.style_encoder.text_encoder)
-    audio_encoder = utils.get_param_num(model.module.style_modeling.style_encoder.audio_encoder)
-    predictors = utils.get_param_num(model.module.style_modeling.duration_predictor)\
-         + utils.get_param_num(model.module.style_modeling.pitch_predictor)\
-              + utils.get_param_num(model.module.style_modeling.energy_predictor)
-    decoder = utils.get_param_num(model.module.decoder)
-    print('Number of Model Parameters          :', num_param)
-    print('Number of Text Encoder Parameters   :', text_encoder)
-    print('Number of Audio Encoder Parameters  :', audio_encoder)
-    print('Number of Predictor Parameters      :', predictors)
-    print('Number of Decoder Parameters        :', decoder)
-
-    # Optimizer and loss
-    optimizer = torch.optim.Adam(
-        model.parameters(), betas=hp.betas, eps=hp.eps, weight_decay=hp.weight_decay)
-    scheduled_optim = ScheduledOptim(
-        optimizer, hp.decoder_hidden, hp.n_warm_up_step, args.restore_step)
-    Loss = STYLERLoss().to(device)
-    DATLoss = DomainAdversarialTrainingLoss().to(device)
-    print("Optimizer and Loss Function Defined.")
-
-    # Load checkpoint if exists
-    checkpoint_path = os.path.join(hp.checkpoint_path())
-    try:
-        checkpoint = torch.load(os.path.join(
-            checkpoint_path, 'checkpoint_{}.pth.tar'.format(args.restore_step)))
-        model.load_state_dict(checkpoint['model'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        print("\n---Model Restored at Step {}---\n".format(args.restore_step))
-    except:
-        print("\n---Start New Training---\n")
-        if not os.path.exists(checkpoint_path):
-            os.makedirs(checkpoint_path)
-
-    # Load vocoder
-    vocoder = utils.get_vocoder()
-
-    # Init logger
-    log_path = hp.log_path()
-    if not os.path.exists(log_path):
-        os.makedirs(log_path)
-        os.makedirs(os.path.join(log_path, 'train'))
-        os.makedirs(os.path.join(log_path, 'validation'))
-    train_logger = SummaryWriter(os.path.join(log_path, 'train'))
-    val_logger = SummaryWriter(os.path.join(log_path, 'validation'))
-
-    # Init synthesis directory
-    synth_path = hp.synth_path()
-    if not os.path.exists(synth_path):
-        os.makedirs(synth_path)
-
-    # Define Some Information
-    Time = np.array([])
-    Start = time.perf_counter()
-
-    # Training
-    model = model.train()
-    for epoch in range(hp.epochs):
-        # Get Training Loader
-        total_step = hp.epochs * len(loader) * hp.batch_size
-
-        for i, batchs in enumerate(loader):
-            for j, data_of_batch in enumerate(batchs):
-                start_time = time.perf_counter()
-
-                current_step = i*hp.batch_size + j + args.restore_step + \
-                    epoch*len(loader)*hp.batch_size + 1
-
-                # Get Data
-                text = torch.from_numpy(
-                    data_of_batch["text"]).long().to(device)
-                mel_target = torch.from_numpy(
-                    data_of_batch["mel_target"]).float().to(device)
-                mel_aug = torch.from_numpy(
-                    data_of_batch["mel_aug"]).float().to(device)
-                D = torch.from_numpy(data_of_batch["D"]).long().to(device)
-                log_D = torch.from_numpy(
-                    data_of_batch["log_D"]).float().to(device)
-                f0 = torch.from_numpy(data_of_batch["f0"]).float().to(device)
-                f0_norm = torch.from_numpy(data_of_batch["f0_norm"]).float().to(device)
-                f0_norm_aug = torch.from_numpy(data_of_batch["f0_norm_aug"]).float().to(device)
-                energy = torch.from_numpy(
-                    data_of_batch["energy"]).float().to(device)
-                energy_input = torch.from_numpy(
-                    data_of_batch["energy_input"]).float().to(device)
-                energy_input_aug = torch.from_numpy(
-                    data_of_batch["energy_input_aug"]).float().to(device)
-                speaker_embed = torch.from_numpy(
-                    data_of_batch["speaker_embed"]).float().to(device)
-                src_len = torch.from_numpy(
-                    data_of_batch["src_len"]).long().to(device)
-                mel_len = torch.from_numpy(
-                    data_of_batch["mel_len"]).long().to(device)
-                max_src_len = np.max(data_of_batch["src_len"]).astype(np.int32)
-                max_mel_len = np.max(data_of_batch["mel_len"]).astype(np.int32)
-
-                # Forward
-                mel_outputs, mel_postnet_outputs, log_duration_output, f0_output, energy_output, src_mask, mel_mask, _, aug_posteriors = model(
-                    text, mel_target, mel_aug, f0_norm, energy_input, src_len, mel_len, D, f0, energy, max_src_len, max_mel_len, speaker_embed=speaker_embed)
-
-                # Cal Loss Clean
-                mel_output, mel_postnet_output = mel_outputs[0], mel_postnet_outputs[0]
-                mel_loss, mel_postnet_loss, d_loss, f_loss, e_loss, classifier_loss_a = Loss(
-                    log_duration_output, log_D, f0_output, f0, energy_output, energy, mel_output, mel_postnet_output, mel_target, ~src_mask, ~mel_mask, src_len, mel_len,\
-                        aug_posteriors, torch.zeros(mel_target.size(0)).long().to(device))
-
-                # Cal Loss Noisy
-                mel_output_noisy, mel_postnet_output_noisy = mel_outputs[1], mel_postnet_outputs[1]
-                mel_noisy_loss, mel_postnet_noisy_loss = Loss.cal_mel_loss(mel_output_noisy, mel_postnet_output_noisy, mel_aug, ~mel_mask)
-
-                # Forward DAT
-                enc_cat = model.module.style_modeling.style_encoder.encoder_input_cat(mel_aug, f0_norm_aug, energy_input_aug, mel_aug)
-                duration_encoding, pitch_encoding, energy_encoding, _ = model.module.style_modeling.style_encoder.audio_encoder(enc_cat, mel_len, src_len, mask=None)
-                aug_posterior_d = model.module.style_modeling.augmentation_classifier_d(duration_encoding)
-                aug_posterior_p = model.module.style_modeling.augmentation_classifier_p(pitch_encoding)
-                aug_posterior_e = model.module.style_modeling.augmentation_classifier_e(energy_encoding)
-
-                # Cal Loss DAT
-                classifier_loss_a_dat = DATLoss((aug_posterior_d, aug_posterior_p, aug_posterior_e), torch.ones(mel_target.size(0)).long().to(device))
-
-                # Total loss
-                total_loss = mel_loss + mel_postnet_loss + mel_noisy_loss + mel_postnet_noisy_loss + d_loss + f_loss + e_loss\
-                    + hp.dat_weight*(classifier_loss_a + classifier_loss_a_dat)
-
-                # Logger
-                t_l = total_loss.item()
-                m_l = mel_loss.item()
-                m_p_l = mel_postnet_loss.item()
-                m_n_l = mel_noisy_loss.item()
-                m_p_n_l = mel_postnet_noisy_loss.item()
-                d_l = d_loss.item()
-                f_l = f_loss.item()
-                e_l = e_loss.item()
-                cl_a = classifier_loss_a.item()
-                cl_a_dat = classifier_loss_a_dat.item()
-
-                # Backward
-                total_loss = total_loss / hp.acc_steps
-                total_loss.backward()
-                if current_step % hp.acc_steps != 0:
-                    continue
-
-                # Clipping gradients to avoid gradient explosion
-                nn.utils.clip_grad_norm_(
-                    model.parameters(), hp.grad_clip_thresh)
-
-                # Update weights
-                scheduled_optim.step_and_update_lr()
-                scheduled_optim.zero_grad()
-
-                # Print
-                if current_step == 1 or current_step % hp.log_step == 0:
-                    Now = time.perf_counter()
-
-                    str1 = "Epoch [{}/{}], Step [{}/{}]:".format(
-                        epoch+1, hp.epochs, current_step, total_step)
-                    str2 = "Total Loss: {:.4f}, Mel Loss: {:.4f}, Mel PostNet Loss: {:.4f}, Duration Loss: {:.4f}, F0 Loss: {:.4f}, Energy Loss: {:.4f};".format(
-                        t_l, m_l, m_p_l, d_l, f_l, e_l)
-                    str3 = "Time Used: {:.3f}s, Estimated Time Remaining: {:.3f}s.".format(
-                        (Now-Start), (total_step-current_step)*np.mean(Time))
-
-                    print("\n" + str1)
-                    print(str2)
-                    print(str3)
-
-                    train_logger.add_scalar(
-                        'Loss/total_loss', t_l, current_step)
-                    train_logger.add_scalar('Loss/mel_loss', m_l, current_step)
-                    train_logger.add_scalar(
-                        'Loss/mel_postnet_loss', m_p_l, current_step)
-                    train_logger.add_scalar('Loss/mel_noisy_loss', m_n_l, current_step)
-                    train_logger.add_scalar(
-                        'Loss/mel_postnet_noisy_loss', m_p_n_l, current_step)
-                    train_logger.add_scalar(
-                        'Loss/duration_loss', d_l, current_step)
-                    train_logger.add_scalar('Loss/F0_loss', f_l, current_step)
-                    train_logger.add_scalar(
-                        'Loss/energy_loss', e_l, current_step)
-                    train_logger.add_scalar(
-                        'Loss/dat_clean_loss', cl_a, current_step)
-                    train_logger.add_scalar(
-                        'Loss/dat_noisy_loss', cl_a_dat, current_step)
-
-                if current_step % hp.save_step == 0:
-                    torch.save({'model': model.state_dict(), 'optimizer': optimizer.state_dict(
-                    )}, os.path.join(checkpoint_path, 'checkpoint_{}.pth.tar'.format(current_step)))
-                    print("save model at step {} ...".format(current_step))
-
-                if current_step == 1 or current_step % hp.synth_step == 0:
-                    length = mel_len[0].item()
-                    mel_target_torch = mel_target[0, :length].detach(
-                    ).unsqueeze(0).transpose(1, 2)
-                    mel_aug_torch = mel_aug[0, :length].detach(
-                    ).unsqueeze(0).transpose(1, 2)
-                    mel_target = mel_target[0, :length].detach(
-                    ).cpu().transpose(0, 1)
-                    mel_aug = mel_aug[0, :length].detach(
-                    ).cpu().transpose(0, 1)
-                    mel_torch = mel_output[0, :length].detach(
-                    ).unsqueeze(0).transpose(1, 2)
-                    mel_noisy_torch = mel_output_noisy[0, :length].detach(
-                    ).unsqueeze(0).transpose(1, 2)
-                    mel = mel_output[0, :length].detach().cpu().transpose(0, 1)
-                    mel_noisy = mel_output_noisy[0, :length].detach().cpu().transpose(0, 1)
-                    mel_postnet_torch = mel_postnet_output[0, :length].detach(
-                    ).unsqueeze(0).transpose(1, 2)
-                    mel_postnet_noisy_torch = mel_postnet_output_noisy[0, :length].detach(
-                    ).unsqueeze(0).transpose(1, 2)
-                    mel_postnet = mel_postnet_output[0, :length].detach(
-                    ).cpu().transpose(0, 1)
-                    mel_postnet_noisy = mel_postnet_output_noisy[0, :length].detach(
-                    ).cpu().transpose(0, 1)
-                    # Audio.tools.inv_mel_spec(mel, os.path.join(
-                    #     synth_path, "step_{}_{}_griffin_lim.wav".format(current_step, "c")))
-                    # Audio.tools.inv_mel_spec(mel_postnet, os.path.join(
-                    #     synth_path, "step_{}_{}_postnet_griffin_lim.wav".format(current_step, "c")))
-                    # Audio.tools.inv_mel_spec(mel_noisy, os.path.join(
-                    #     synth_path, "step_{}_{}_griffin_lim.wav".format(current_step, "n")))
-                    # Audio.tools.inv_mel_spec(mel_postnet_noisy, os.path.join(
-                    #     synth_path, "step_{}_{}_postnet_griffin_lim.wav".format(current_step, "n")))
-
-                    wav_mel = utils.vocoder_infer(mel_torch, vocoder, os.path.join(
-                        hp.synth_path(), 'step_{}_{}_{}.wav'.format(current_step, "c", hp.vocoder)))
-                    wav_mel_postnet = utils.vocoder_infer(mel_postnet_torch, vocoder, os.path.join(
-                        hp.synth_path(), 'step_{}_{}_postnet_{}.wav'.format(current_step, "c", hp.vocoder)))
-                    wav_ground_truth = utils.vocoder_infer(mel_target_torch, vocoder, os.path.join(
-                        hp.synth_path(), 'step_{}_{}_ground-truth_{}.wav'.format(current_step, "c", hp.vocoder)))
-                    wav_mel_noisy = utils.vocoder_infer(mel_noisy_torch, vocoder, os.path.join(
-                        hp.synth_path(), 'step_{}_{}_{}.wav'.format(current_step, "n", hp.vocoder)))
-                    wav_mel_postnet_noisy = utils.vocoder_infer(mel_postnet_noisy_torch, vocoder, os.path.join(
-                        hp.synth_path(), 'step_{}_{}_postnet_{}.wav'.format(current_step, "n", hp.vocoder)))
-                    wav_aug = utils.vocoder_infer(mel_aug_torch, vocoder, os.path.join(
-                        hp.synth_path(), 'step_{}_{}_ground-truth_{}.wav'.format(current_step, "n", hp.vocoder)))
-
-                    # Model duration prediction
-                    log_duration_output = log_duration_output[0, :src_len[0].item()].detach().cpu() # [seg_len]
-                    log_duration_output = torch.clamp(torch.round(torch.exp(log_duration_output)-hp.log_offset), min=0).int()
-                    model_duration = utils.get_alignment_2D(log_duration_output).T # [seg_len, mel_len]
-                    model_duration = utils.plot_alignment([model_duration])
-
-                    # Model mel prediction
-                    f0 = f0[0, :length].detach().cpu().numpy()
-                    energy = energy[0, :length].detach().cpu().numpy()
-                    f0_output = f0_output[0, :length].detach().cpu().numpy()
-                    energy_output = energy_output[0,
-                                                  :length].detach().cpu().numpy()
-                    mel_predicted = utils.plot_data([(mel_postnet.numpy(), f0_output, energy_output), (mel_target.numpy(), f0, energy)],
-                                    ['Synthetized Spectrogram Clean', 'Ground-Truth Spectrogram'], filename=os.path.join(synth_path, 'step_{}_{}.png'.format(current_step, "c")))
-                    mel_noisy_predicted = utils.plot_data([(mel_postnet_noisy.numpy(), f0_output, energy_output), (mel_aug.numpy(), f0, energy)],
-                                    ['Synthetized Spectrogram Noisy', 'Aug Spectrogram'], filename=os.path.join(synth_path, 'step_{}_{}.png'.format(current_step, "n")))
-
-                    # Normalize audio for tensorboard logger. See https://github.com/lanpa/tensorboardX/issues/511#issuecomment-537600045
-                    wav_ground_truth = wav_ground_truth/max(wav_ground_truth)
-                    wav_mel = wav_mel/max(wav_mel)
-                    wav_mel_postnet = wav_mel_postnet/max(wav_mel_postnet)
-                    wav_aug = wav_aug/max(wav_aug)
-                    wav_mel_noisy = wav_mel_noisy/max(wav_mel_noisy)
-                    wav_mel_postnet_noisy = wav_mel_postnet_noisy/max(wav_mel_postnet_noisy)
-
-                    train_logger.add_image(
-                        "model_duration",
-                        model_duration,
-                        current_step, dataformats='HWC')
-                    train_logger.add_image(
-                        "mel_predicted/Clean",
-                        mel_predicted,
-                        current_step, dataformats='HWC')
-                    train_logger.add_image(
-                        "mel_predicted/Noisy",
-                        mel_noisy_predicted,
-                        current_step, dataformats='HWC')
-                    train_logger.add_audio(
-                        "Clean/wav_ground_truth",
-                        wav_ground_truth,
-                        current_step, sample_rate=hp.sampling_rate)
-                    train_logger.add_audio(
-                        "Clean/wav_mel",
-                        wav_mel,
-                        current_step, sample_rate=hp.sampling_rate)
-                    train_logger.add_audio(
-                        "Clean/wav_mel_postnet",
-                        wav_mel_postnet,
-                        current_step, sample_rate=hp.sampling_rate)
-                    train_logger.add_audio(
-                        "Noisy/wav_aug",
-                        wav_aug,
-                        current_step, sample_rate=hp.sampling_rate)
-                    train_logger.add_audio(
-                        "Noisy/wav_mel_noisy",
-                        wav_mel_noisy,
-                        current_step, sample_rate=hp.sampling_rate)
-                    train_logger.add_audio(
-                        "Noisy/wav_mel_postnet_noisy",
-                        wav_mel_postnet_noisy,
-                        current_step, sample_rate=hp.sampling_rate)
-
-                if current_step == 1 or current_step % hp.eval_step == 0:
-                    model.eval()
-                    with torch.no_grad():
-                        d_l, f_l, e_l, cl_a, cl_a_dat, m_l, m_p_l, m_n_l, m_p_n_l = evaluate(
-                            model, current_step)
-                        t_l = d_l + f_l + e_l + m_l + m_p_l + m_n_l + m_p_n_l\
-                            + hp.dat_weight*(cl_a + cl_a_dat)
-
-                        val_logger.add_scalar(
-                            'Loss/total_loss', t_l, current_step)
-                        val_logger.add_scalar(
-                            'Loss/mel_loss', m_l, current_step)
-                        val_logger.add_scalar(
-                            'Loss/mel_postnet_loss', m_p_l, current_step)
-                        val_logger.add_scalar(
-                            'Loss/mel_noisy_loss', m_n_l, current_step)
-                        val_logger.add_scalar(
-                            'Loss/mel_postnet_noisy_loss', m_p_n_l, current_step)
-                        val_logger.add_scalar(
-                            'Loss/duration_loss', d_l, current_step)
-                        val_logger.add_scalar(
-                            'Loss/F0_loss', f_l, current_step)
-                        val_logger.add_scalar(
-                            'Loss/energy_loss', e_l, current_step)
-                        val_logger.add_scalar(
-                            'Loss/dat_clean_loss', cl_a, current_step)
-                        val_logger.add_scalar(
-                            'Loss/dat_noisy_loss', cl_a_dat, current_step)
-
-                    model.train()
-
-                end_time = time.perf_counter()
-                Time = np.append(Time, end_time - start_time)
-                if len(Time) == hp.clear_Time:
-                    temp_value = np.mean(Time)
-                    Time = np.delete(
-                        Time, [i for i in range(len(Time))], axis=None)
-                    Time = np.append(Time, temp_value)
+import common
+import data_functions
+import loss_functions
+import models
 
 
-if __name__ == "__main__":
+def parse_args(parser):
+    """
+    Parse commandline arguments.
+    """
+    parser.add_argument('-o', '--output', type=str, required=True,
+                        help='Directory to save checkpoints')
+    parser.add_argument('-d', '--dataset-path', type=str, default='./',
+                        help='Path to dataset')
+    parser.add_argument('--log-file', type=str, default=None,
+                        help='Path to a DLLogger log file')
+    parser.add_argument('--pyprof', action='store_true', help='Enable pyprof profiling')
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--restore_step', type=int, default=0)
-    parser.add_argument('--version', type=str, default="default")
-    parser.add_argument('--batch_size', type=int, default=hp.batch_size)
-    args = parser.parse_args()
+    training = parser.add_argument_group('training setup')
+    training.add_argument('--epochs', type=int, required=True,
+                          help='Number of total epochs to run')
+    training.add_argument('--epochs-per-checkpoint', type=int, default=50,
+                          help='Number of epochs per checkpoint')
+    training.add_argument('--checkpoint-path', type=str, default=None,
+                          help='Checkpoint path to resume training')
+    training.add_argument('--resume', action='store_true',
+                          help='Resume training from the last available checkpoint')
+    training.add_argument('--seed', type=int, default=1234,
+                          help='Seed for PyTorch random number generators')
+    training.add_argument('--amp', action='store_true',
+                          help='Enable AMP')
+    training.add_argument('--cuda', action='store_true',
+                          help='Run on GPU using CUDA')
+    training.add_argument('--cudnn-benchmark', action='store_true',
+                          help='Enable cudnn benchmark mode')
+    training.add_argument('--ema-decay', type=float, default=0,
+                          help='Discounting factor for training weights EMA')
+    training.add_argument('--gradient-accumulation-steps', type=int, default=1,
+                          help='Training steps to accumulate gradients for')
 
-    # Set Batch Size
-    hp.batch_size = args.batch_size
+    optimization = parser.add_argument_group('optimization setup')
+    optimization.add_argument('--optimizer', type=str, default='lamb',
+                              help='Optimization algorithm')
+    optimization.add_argument('-lr', '--learning-rate', type=float, required=True,
+                              help='Learing rate')
+    optimization.add_argument('--weight-decay', default=1e-6, type=float,
+                              help='Weight decay')
+    optimization.add_argument('--grad-clip-thresh', default=1000.0, type=float,
+                              help='Clip threshold for gradients')
+    optimization.add_argument('-bs', '--batch-size', type=int, required=True,
+                              help='Batch size per GPU')
+    optimization.add_argument('--warmup-steps', type=int, default=1000,
+                              help='Number of steps for lr warmup')
+    optimization.add_argument('--dur-predictor-loss-scale', type=float,
+                              default=1.0, help='Rescale duration predictor loss')
+    optimization.add_argument('--pitch-predictor-loss-scale', type=float,
+                              default=1.0, help='Rescale pitch predictor loss')
 
-    # Version Control
-    hp.version = args.version + "_batch{}".format(hp.batch_size)
+    dataset = parser.add_argument_group('dataset parameters')
+    dataset.add_argument('--training-files', type=str, required=True,
+                         help='Path to training filelist. Separate multiple paths with commas.')
+    dataset.add_argument('--validation-files', type=str, required=True,
+                         help='Path to validation filelist. Separate multiple paths with commas.')
+    dataset.add_argument('--pitch-mean-std-file', type=str, default=None,
+                         help='Path to pitch stats to be stored in the model')
+    dataset.add_argument('--text-cleaners', nargs='*',
+                         default=['english_cleaners'], type=str,
+                         help='Type of text cleaners for input text')
+    dataset.add_argument('--symbol-set', type=str, default='english_basic',
+                         help='Define symbol set for input text')
 
-    main(args)
+    cond = parser.add_argument_group('conditioning on additional attributes')
+    cond.add_argument('--n-speakers', type=int, default=1,
+                      help='Condition on speaker, value > 1 enables trainable speaker embeddings.')
+
+    distributed = parser.add_argument_group('distributed setup')
+    distributed.add_argument('--local_rank', type=int, default=os.getenv('LOCAL_RANK', 0),
+                             help='Rank of the process for multiproc. Do not set manually.')
+    distributed.add_argument('--world_size', type=int, default=os.getenv('WORLD_SIZE', 1),
+                             help='Number of processes for multiproc. Do not set manually.')
+    return parser
+
+
+def reduce_tensor(tensor, num_gpus):
+    rt = tensor.clone()
+    dist.all_reduce(rt, op=dist.ReduceOp.SUM)
+    return rt.true_divide(num_gpus)
+
+
+def init_distributed(args, world_size, rank):
+    assert torch.cuda.is_available(), "Distributed mode requires CUDA."
+    print("Initializing distributed training")
+
+    # Set cuda device so everything is done on the right GPU.
+    torch.cuda.set_device(rank % torch.cuda.device_count())
+
+    # Initialize distributed communication
+    dist.init_process_group(backend=('nccl' if args.cuda else 'gloo'),
+                            init_method='env://')
+    print("Done initializing distributed training")
+
+
+def last_checkpoint(output):
+
+    def corrupted(fpath):
+        try:
+            torch.load(fpath, map_location='cpu')
+            return False
+        except:
+            print(f'WARNING: Cannot load {fpath}')
+            return True
+
+    saved = sorted(
+        glob.glob(f'{output}/FastPitch_checkpoint_*.pt'),
+        key=lambda f: int(re.search('_(\d+).pt', f).group(1)))
+
+    if len(saved) >= 1 and not corrupted(saved[-1]):
+        return saved[-1]
+    elif len(saved) >= 2:
+        return saved[-2]
+    else:
+        return None
+
+
+def save_checkpoint(local_rank, model, ema_model, optimizer, epoch, total_iter,
+                    config, amp_run, filepath):
+    if local_rank != 0:
+        return
+
+    print(f"Saving model and optimizer state at epoch {epoch} to {filepath}")
+    ema_dict = None if ema_model is None else ema_model.state_dict()
+    checkpoint = {'epoch': epoch,
+                  'iteration': total_iter,
+                  'config': config,
+                  'state_dict': model.state_dict(),
+                  'ema_state_dict': ema_dict,
+                  'optimizer': optimizer.state_dict()}
+    if amp_run:
+        checkpoint['amp'] = amp.state_dict()
+    torch.save(checkpoint, filepath)
+
+
+def load_checkpoint(local_rank, model, ema_model, optimizer, epoch, total_iter,
+                    config, amp_run, filepath, world_size):
+    if local_rank == 0:
+        print(f'Loading model and optimizer state from {filepath}')
+    checkpoint = torch.load(filepath, map_location='cpu')
+    epoch[0] = checkpoint['epoch'] + 1
+    total_iter[0] = checkpoint['iteration']
+    config = checkpoint['config']
+
+    sd = {k.replace('module.', ''): v
+          for k, v in checkpoint['state_dict'].items()}
+    getattr(model, 'module', model).load_state_dict(sd)
+    optimizer.load_state_dict(checkpoint['optimizer'])
+
+    if amp_run:
+        amp.load_state_dict(checkpoint['amp'])
+
+    if ema_model is not None:
+        ema_model.load_state_dict(checkpoint['ema_state_dict'])
+
+
+def validate(model, epoch, total_iter, criterion, valset, batch_size,
+             collate_fn, distributed_run, batch_to_gpu, use_gt_durations=False,
+             ema=False):
+    """Handles all the validation scoring and printing"""
+    was_training = model.training
+    model.eval()
+
+    tik = time.perf_counter()
+    with torch.no_grad():
+        val_sampler = DistributedSampler(valset) if distributed_run else None
+        val_loader = DataLoader(valset, num_workers=8, shuffle=False,
+                                sampler=val_sampler,
+                                batch_size=batch_size, pin_memory=False,
+                                collate_fn=collate_fn)
+        val_meta = defaultdict(float)
+        val_num_frames = 0
+        for i, batch in enumerate(val_loader):
+            x, y, num_frames = batch_to_gpu(batch)
+            y_pred = model(x, use_gt_durations=use_gt_durations)
+            loss, meta = criterion(y_pred, y, is_training=False, meta_agg='sum')
+
+            if distributed_run:
+                for k,v in meta.items():
+                    val_meta[k] += reduce_tensor(v, 1)
+                val_num_frames += reduce_tensor(num_frames.data, 1).item()
+            else:
+                for k,v in meta.items():
+                    val_meta[k] += v
+                val_num_frames = num_frames.item()
+
+        val_meta = {k: v / len(valset) for k,v in val_meta.items()}
+
+    val_meta['took'] = time.perf_counter() - tik
+
+    logger.log((epoch,) if epoch is not None else (),
+               tb_total_steps=total_iter,
+               subset='val_ema' if ema else 'val',
+               data=OrderedDict([
+                   ('loss', val_meta['loss'].item()),
+                   ('mel_loss', val_meta['mel_loss'].item()),
+                   ('frames/s', num_frames.item() / val_meta['took']),
+                   ('took', val_meta['took'])]),
+    )
+
+    if was_training:
+        model.train()
+    return val_meta
+
+
+def adjust_learning_rate(total_iter, opt, learning_rate, warmup_iters=None):
+    if warmup_iters == 0:
+        scale = 1.0
+    elif total_iter > warmup_iters:
+        scale = 1. / (total_iter ** 0.5)
+    else:
+        scale = total_iter / (warmup_iters ** 1.5)
+
+    for param_group in opt.param_groups:
+        param_group['lr'] = learning_rate * scale
+
+
+def apply_ema_decay(model, ema_model, decay):
+    if not decay:
+        return
+    st = model.state_dict()
+    add_module = hasattr(model, 'module') and not hasattr(ema_model, 'module')
+    for k,v in ema_model.state_dict().items():
+        if add_module and not k.startswith('module.'):
+            k = 'module.' + k
+        v.copy_(decay * v + (1 - decay) * st[k])
+
+
+def apply_multi_tensor_ema(model_weight_list, ema_model_weight_list, decay, overflow_buf):
+    if not decay:
+        return
+    amp_C.multi_tensor_axpby(65536, overflow_buf, [ema_model_weight_list, model_weight_list, ema_model_weight_list], decay, 1-decay, -1)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='PyTorch FastPitch Training',
+                                     allow_abbrev=False)
+    parser = parse_args(parser)
+    args, _ = parser.parse_known_args()
+
+    distributed_run = args.world_size > 1
+
+    torch.manual_seed(args.seed + args.local_rank)
+    np.random.seed(args.seed + args.local_rank)
+
+    if args.local_rank == 0:
+        if not os.path.exists(args.output):
+            os.makedirs(args.output)
+
+    log_fpath = args.log_file or os.path.join(args.output, 'nvlog.json')
+    tb_subsets = ['train', 'val']
+    if args.ema_decay > 0.0:
+        tb_subsets.append('val_ema')
+
+    logger.init(log_fpath, args.output, enabled=(args.local_rank == 0),
+                tb_subsets=tb_subsets)
+    logger.parameters(vars(args), tb_subset='train')
+
+    parser = models.parse_model_args('FastPitch', parser)
+    args, unk_args = parser.parse_known_args()
+    if len(unk_args) > 0:
+        raise ValueError(f'Invalid options {unk_args}')
+
+    torch.backends.cudnn.benchmark = args.cudnn_benchmark
+
+    if distributed_run:
+        init_distributed(args, args.world_size, args.local_rank)
+
+    device = torch.device('cuda' if args.cuda else 'cpu')
+    model_config = models.get_model_config('FastPitch', args)
+    model = models.get_model('FastPitch', model_config, device)
+
+    # Store pitch mean/std as params to translate from Hz during inference
+    with open(args.pitch_mean_std_file, 'r') as f:
+        stats = json.load(f)
+    model.pitch_mean[0] = stats['mean']
+    model.pitch_std[0] = stats['std']
+
+    kw = dict(lr=args.learning_rate, betas=(0.9, 0.98), eps=1e-9,
+              weight_decay=args.weight_decay)
+    if args.optimizer == 'adam':
+        optimizer = FusedAdam(model.parameters(), **kw)
+    elif args.optimizer == 'lamb':
+        optimizer = FusedLAMB(model.parameters(), **kw)
+    else:
+        raise ValueError
+
+    if args.amp:
+        model, optimizer = amp.initialize(model, optimizer, opt_level="O1")
+
+    if args.ema_decay > 0:
+        ema_model = copy.deepcopy(model)
+    else:
+        ema_model = None
+
+    if distributed_run:
+        model = DistributedDataParallel(
+            model, device_ids=[args.local_rank], output_device=args.local_rank,
+            find_unused_parameters=True)
+
+    if args.pyprof:
+        pyprof.init(enable_function_stack=True)
+
+    start_epoch = [1]
+    start_iter = [0]
+
+    assert args.checkpoint_path is None or args.resume is False, (
+        "Specify a single checkpoint source")
+    if args.checkpoint_path is not None:
+        ch_fpath = args.checkpoint_path
+    elif args.resume:
+        ch_fpath = last_checkpoint(args.output)
+    else:
+        ch_fpath = None
+
+    if ch_fpath is not None:
+        load_checkpoint(args.local_rank, model, ema_model, optimizer, start_epoch,
+                        start_iter, model_config, args.amp, ch_fpath,
+                        args.world_size)
+
+    start_epoch = start_epoch[0]
+    total_iter = start_iter[0]
+
+    criterion = loss_functions.get_loss_function('FastPitch',
+        dur_predictor_loss_scale=args.dur_predictor_loss_scale,
+        pitch_predictor_loss_scale=args.pitch_predictor_loss_scale)
+
+    collate_fn = data_functions.get_collate_function('FastPitch')
+    trainset = data_functions.get_data_loader('FastPitch',
+                                              audiopaths_and_text=args.training_files,
+                                              **vars(args))
+    valset = data_functions.get_data_loader('FastPitch',
+                                            audiopaths_and_text=args.validation_files,
+                                            **vars(args))
+    if distributed_run:
+        train_sampler, shuffle = DistributedSampler(trainset), False
+    else:
+        train_sampler, shuffle = None, True
+
+    train_loader = DataLoader(trainset, num_workers=16, shuffle=shuffle,
+                              sampler=train_sampler, batch_size=args.batch_size,
+                              pin_memory=False, drop_last=True,
+                              collate_fn=collate_fn)
+
+    batch_to_gpu = data_functions.get_batch_to_gpu('FastPitch')
+
+    if args.ema_decay:
+        ema_model_weight_list, model_weight_list, overflow_buf_for_ema = init_multi_tensor_ema(model, ema_model)
+    else:
+        ema_model_weight_list, model_weight_list, overflow_buf_for_ema = None, None, None
+
+    model.train()
+
+    if args.pyprof:
+        torch.autograd.profiler.emit_nvtx().__enter__()
+        profiler.start()
+
+    torch.cuda.synchronize()
+    for epoch in range(start_epoch, args.epochs + 1):
+        epoch_start_time = time.perf_counter()
+
+        epoch_loss = 0.0
+        epoch_mel_loss = 0.0
+        epoch_num_frames = 0
+        epoch_frames_per_sec = 0.0
+
+        if distributed_run:
+            train_loader.sampler.set_epoch(epoch)
+
+        accumulated_steps = 0
+        iter_loss = 0
+        iter_num_frames = 0
+        iter_meta = {}
+
+        epoch_iter = 0
+        num_iters = len(train_loader) // args.gradient_accumulation_steps
+        for batch in train_loader:
+
+            if accumulated_steps == 0:
+                if epoch_iter == num_iters:
+                    break
+                total_iter += 1
+                epoch_iter += 1
+                iter_start_time = time.perf_counter()
+
+                adjust_learning_rate(total_iter, optimizer, args.learning_rate,
+                                     args.warmup_steps)
+
+                model.zero_grad()
+
+            x, y, num_frames = batch_to_gpu(batch)
+            y_pred = model(x, use_gt_durations=True)
+            loss, meta = criterion(y_pred, y)
+
+            loss /= args.gradient_accumulation_steps
+            meta = {k: v / args.gradient_accumulation_steps
+                    for k, v in meta.items()}
+
+            if args.amp:
+                with amp.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                loss.backward()
+
+            if distributed_run:
+                reduced_loss = reduce_tensor(loss.data, args.world_size).item()
+                reduced_num_frames = reduce_tensor(num_frames.data, 1).item()
+                meta = {k: reduce_tensor(v, args.world_size) for k,v in meta.items()}
+            else:
+                reduced_loss = loss.item()
+                reduced_num_frames = num_frames.item()
+            if np.isnan(reduced_loss):
+                raise Exception("loss is NaN")
+
+            accumulated_steps += 1
+            iter_loss += reduced_loss
+            iter_num_frames += reduced_num_frames
+            iter_meta = {k: iter_meta.get(k, 0) + meta.get(k, 0) for k in meta}
+
+            if accumulated_steps % args.gradient_accumulation_steps == 0:
+
+                logger.log_grads_tb(total_iter, model)
+                if args.amp:
+                    torch.nn.utils.clip_grad_norm_(
+                        amp.master_params(optimizer), args.grad_clip_thresh)
+                else:
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), args.grad_clip_thresh)
+
+                optimizer.step()
+                apply_multi_tensor_ema(model_weight_list, ema_model_weight_list, args.ema_decay, overflow_buf_for_ema)
+
+                iter_time = time.perf_counter() - iter_start_time
+                iter_mel_loss = iter_meta['mel_loss'].item()
+                epoch_frames_per_sec += iter_num_frames / iter_time
+                epoch_loss += iter_loss
+                epoch_num_frames += iter_num_frames
+                epoch_mel_loss += iter_mel_loss
+
+                logger.log((epoch, epoch_iter, num_iters),
+                           tb_total_steps=total_iter,
+                           subset='train',
+                           data=OrderedDict([
+                               ('loss', iter_loss),
+                               ('mel_loss', iter_mel_loss),
+                               ('frames/s', iter_num_frames / iter_time),
+                               ('took', iter_time),
+                               ('lrate', optimizer.param_groups[0]['lr'])]),
+                )
+
+                accumulated_steps = 0
+                iter_loss = 0
+                iter_num_frames = 0
+                iter_meta = {}
+
+        # Finished epoch
+        epoch_time = time.perf_counter() - epoch_start_time
+
+        logger.log((epoch,),
+                   tb_total_steps=None,
+                   subset='train_avg',
+                   data=OrderedDict([
+                       ('loss', epoch_loss / epoch_iter),
+                       ('mel_loss', epoch_mel_loss / epoch_iter),
+                       ('frames/s', epoch_num_frames / epoch_time),
+                       ('took', epoch_time)]),
+        )
+
+        validate(model, epoch, total_iter, criterion, valset, args.batch_size,
+                 collate_fn, distributed_run, batch_to_gpu,
+                 use_gt_durations=True)
+
+        if args.ema_decay > 0:
+            validate(ema_model, epoch, total_iter, criterion, valset,
+                     args.batch_size, collate_fn, distributed_run, batch_to_gpu,
+                     use_gt_durations=True, ema=True)
+
+        if (epoch > 0 and args.epochs_per_checkpoint > 0 and
+            (epoch % args.epochs_per_checkpoint == 0) and args.local_rank == 0):
+
+            checkpoint_path = os.path.join(
+                args.output, f"FastPitch_checkpoint_{epoch}.pt")
+            save_checkpoint(args.local_rank, model, ema_model, optimizer, epoch,
+                            total_iter, model_config, args.amp, checkpoint_path)
+        logger.flush()
+
+    # Finished training
+    if args.pyprof:
+        profiler.stop()
+        torch.autograd.profiler.emit_nvtx().__exit__(None, None, None)
+
+    logger.log((),
+               tb_total_steps=None,
+               subset='train_avg',
+               data=OrderedDict([
+                   ('loss', epoch_loss / epoch_iter),
+                   ('mel_loss', epoch_mel_loss / epoch_iter),
+                   ('frames/s', epoch_num_frames / epoch_time),
+                   ('took', epoch_time)]),
+    )
+    validate(model, None, total_iter, criterion, valset, args.batch_size,
+             collate_fn, distributed_run, batch_to_gpu, use_gt_durations=True)
+
+    if (epoch > 0 and args.epochs_per_checkpoint > 0 and
+        (epoch % args.epochs_per_checkpoint != 0) and args.local_rank == 0):
+        checkpoint_path = os.path.join(
+            args.output, f"FastPitch_checkpoint_{epoch}.pt")
+        save_checkpoint(args.local_rank, model, ema_model, optimizer, epoch,
+                        total_iter, model_config, args.amp, checkpoint_path)
+
+
+if __name__ == '__main__':
+    main()
